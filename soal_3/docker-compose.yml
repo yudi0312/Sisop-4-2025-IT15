@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  antink-server:
+    build: .
+    container_name: antink-server
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    volumes:
+      - ./it24_host:/it24_host
+      - ./antink_mount:/mnt/antink
+      - ./antink-logs:/var/log
+
+  antink-logger:
+    image: ubuntu:22.04
+    container_name: antink-logger
+    volumes:
+      - ./antink-logs/it24.log:/var/log/it24.log
+    command: tail -f /var/log/it24.log
