@@ -1,306 +1,301 @@
-
 #define FUSE_USE_VERSION 31
 #include <fuse3/fuse.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdlib.h>
 #include <dirent.h>
-#include <unistd.h>
-#include <time.h>
 #include <sys/stat.h>
-#include <limits.h>
-#include <stdbool.h>
-#include <glib.h>
-#include <pthread.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#include <stdarg.h>
 
-#define RELIC_DIR "/home/yudi0312/PRAKTIKUM_SISOP/Sisop-4-2025-IT15/soal_2/relics"
+#define RELIC_PATH "/home/yudi0312/PRAKTIKUM_SISOP/Sisop-4-2025-IT15/soal_2/relics"
 #define LOG_FILE "/home/yudi0312/PRAKTIKUM_SISOP/Sisop-4-2025-IT15/soal_2/activity.log"
-#define MAX_PIECE_SIZE 1024
-static const char *MOUNT_DIR = "/home/yudi0312/PRAKTIKUM_SISOP/Sisop-4-2025-IT15/soal_2/mount_dir";
+#define CHUNK_SIZE 1024
+#define MAX_CHUNKS 100
 
-void write_log(const char *message) {
+pid_t last_open_pid = 0;
+
+
+void write_log(const char *format, ...) {
     FILE *log = fopen(LOG_FILE, "a");
     if (!log) return;
+
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
-    fprintf(log, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
+    fprintf(log, "[%04d-%02d-%02d %02d:%02d:%02d] ",
             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-            t->tm_hour, t->tm_min, t->tm_sec, message);
+            t->tm_hour, t->tm_min, t->tm_sec);
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(log, format, args);
+    va_end(args);
+
+    fprintf(log, "\n");
     fclose(log);
 }
 
-typedef struct {
-    bool is_copy;
-} file_status_t;
+static char last_open_file[256] = {0};
+static int last_open_mode = 0; 
+static int copy_logged = 0;
 
-GHashTable *file_status_table;
-pthread_mutex_t status_lock = PTHREAD_MUTEX_INITIALIZER;
+static int baymax_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
+    (void) fi;
+    memset(stbuf, 0, sizeof(struct stat));
 
-static int fs_getattr(const char *path, struct stat *st, struct fuse_file_info *fi) {
-    memset(st, 0, sizeof(struct stat));
     if (strcmp(path, "/") == 0) {
-        st->st_mode = S_IFDIR | 0755;
-        st->st_nlink = 2;
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
         return 0;
     }
 
-    char base[256];
-    snprintf(base, sizeof(base), "%s", path + 1);
+    const char *filename = path + 1; 
 
-    char frag_path[512];
-    snprintf(frag_path, sizeof(frag_path), "%s/%s.000", RELIC_DIR, base);
+    char chunk_path[512];
+    off_t total_size = 0;
+    int found = 0;
 
-    FILE *f = fopen(frag_path, "rb");
-    if (!f) return -ENOENT;
-
-    fseek(f, 0, SEEK_END);
-    size_t size = ftell(f);
-    fclose(f);
-
-    int i = 1;
-    char tmp[512];
-    while (1) {
-        snprintf(tmp, sizeof(tmp), "%s/%s.%03d", RELIC_DIR, base, i);
-        FILE *next = fopen(tmp, "rb");
-        if (!next) break;
-        fseek(next, 0, SEEK_END);
-        size += ftell(next);
-        fclose(next);
-        i++;
+    for (int i = 0; i < MAX_CHUNKS; i++) {
+        snprintf(chunk_path, sizeof(chunk_path), "%s/%s.%03d", RELIC_PATH, filename, i);
+        FILE *fp = fopen(chunk_path, "rb");
+        if (!fp) {
+            if (i == 0 && !found) return -ENOENT;
+            break;
+        }
+        found = 1;
+        fseek(fp, 0, SEEK_END);
+        total_size += ftell(fp);
+        fclose(fp);
     }
 
-    st->st_mode = S_IFREG | 0644;
-    st->st_nlink = 1;
-    st->st_size = size;
+    if (!found)
+        return -ENOENT;
+
+    stbuf->st_mode = S_IFREG | 0644;
+    stbuf->st_nlink = 1;
+    stbuf->st_size = total_size;
+
     return 0;
 }
 
-static int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-                      off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
+static int baymax_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+                          off_t offset, struct fuse_file_info *fi,
+                          enum fuse_readdir_flags flags) {
+    (void) offset;
+    (void) fi;
+    (void) flags;
+
+    if (strcmp(path, "/") != 0)
+        return -ENOENT;
+
     filler(buf, ".", NULL, 0, 0);
     filler(buf, "..", NULL, 0, 0);
 
-    DIR *dir = opendir(RELIC_DIR);
-    if (!dir) return -ENOENT;
+    DIR *d = opendir(RELIC_PATH);
+    if (d) {
+        struct dirent *entry;
+        char last_file[256] = {0};
+        while ((entry = readdir(d)) != NULL) {
+            char *dot = strrchr(entry->d_name, '.');
+            if (!dot) continue;
+            if (strlen(dot) != 4) continue;
 
-    struct dirent *dp;
-    char seen[100][256];
-    int seen_count = 0;
+            char base_name[256];
+            size_t len = dot - entry->d_name;
+            if (len >= sizeof(base_name)) len = sizeof(base_name) - 1;
+            strncpy(base_name, entry->d_name, len);
+            base_name[len] = '\0';
 
-    while ((dp = readdir(dir)) != NULL) {
-        char *dot = strrchr(dp->d_name, '.');
-        if (!dot || strlen(dot) != 4) continue;
-        char name[256];
-        strncpy(name, dp->d_name, strlen(dp->d_name) - 4);
-        name[strlen(dp->d_name) - 4] = '\0';
-
-        int already_seen = 0;
-        for (int i = 0; i < seen_count; i++) {
-            if (strcmp(seen[i], name) == 0) {
-                already_seen = 1;
-                break;
+            if (strcmp(base_name, last_file) != 0) {
+                filler(buf, base_name, NULL, 0, 0);
+                strcpy(last_file, base_name);
             }
         }
-        if (!already_seen) {
-            filler(buf, name, NULL, 0, 0);
-            strcpy(seen[seen_count++], name);
-        }
+        closedir(d);
     }
-    closedir(dir);
+
     return 0;
 }
 
-static int fs_open(const char *path, struct fuse_file_info *fi) {
-    char name[256];
-    snprintf(name, sizeof(name), "%s", path + 1);
+static int baymax_open(const char *path, struct fuse_file_info *fi) {
+    const char *filename = path + 1;
 
-    char frag[512];
-    snprintf(frag, sizeof(frag), "%s/%s.000", RELIC_DIR, name);
-    int fd = open(frag, O_RDONLY);
-    if (fd == -1) return -ENOENT;
+    FILE *fp;
+    char chunk_path[512];
+    snprintf(chunk_path, sizeof(chunk_path), "%s/%s.%03d", RELIC_PATH, filename, 0);
 
-    fi->fh = fd;
+    fp = fopen(chunk_path, "rb");
+    if (!fp) return -ENOENT;
+    fclose(fp);
 
-    char cwd[PATH_MAX];
-    getcwd(cwd, sizeof(cwd));
-
-    pthread_mutex_lock(&status_lock);
-    file_status_t *status = g_hash_table_lookup(file_status_table, name);
-  
-    bool is_outside_mount = strncmp(cwd, MOUNT_DIR, strlen(MOUNT_DIR)) != 0;
-    if (is_outside_mount) {
-
-        if (!status) {
-            status = malloc(sizeof(file_status_t));
-            status->is_copy = true;
-            g_hash_table_insert(file_status_table, strdup(name), status);
-
-            char log_msg[1024];
-            snprintf(log_msg, sizeof(log_msg), "COPY: %s -> /tmp/%s", name, name);
-            write_log(log_msg);
-        }
-
-    } else {
-
-        if (!status || !status->is_copy) {
-
-            char log_msg[1024];
-            snprintf(log_msg, sizeof(log_msg), "READ: %s", name);
-            write_log(log_msg);
-        }
-    }
-
-    pthread_mutex_unlock(&status_lock);
-    return 0;
-}
-
-
-static int fs_read(const char *path, char *buf, size_t size, off_t offset,
-                   struct fuse_file_info *fi) {
-    char name[256];
-    snprintf(name, sizeof(name), "%s", path + 1);
-
-    size_t read_bytes = 0;
-    size_t pos = 0;
-    int i = 0;
-    while (1) {
-        char frag_path[512];
-        snprintf(frag_path, sizeof(frag_path), "%s/%s.%03d", RELIC_DIR, name, i);
-        FILE *f = fopen(frag_path, "rb");
-        if (!f) break;
-
-        fseek(f, 0, SEEK_END);
-        size_t frag_size = ftell(f);
-        rewind(f);
-
-        if (offset < pos + frag_size) {
-            fseek(f, offset > pos ? offset - pos : 0, SEEK_SET);
-            size_t to_read = (size - read_bytes < frag_size) ? size - read_bytes : frag_size;
-            to_read = to_read < MAX_PIECE_SIZE ? to_read : MAX_PIECE_SIZE;
-            read_bytes += fread(buf + read_bytes, 1, to_read, f);
-            fclose(f);
-            i++;
-            if (read_bytes >= size) break;
-        } else {
-            pos += frag_size;
-            fclose(f);
-            i++;
-        }
-    }
-    return read_bytes;
-}
-
-static int fs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
-    char name[256];
-    snprintf(name, sizeof(name), "%s", path + 1);
-
-    char frag_path[512];
-    snprintf(frag_path, sizeof(frag_path), "%s/%s.000", RELIC_DIR, name);
-    FILE *f = fopen(frag_path, "wb");
-    if (!f) return -EACCES;
-    fclose(f);
-
-    int fd = open(frag_path, O_RDWR);
-    if (fd == -1) return -EACCES;
-    fi->fh = fd;
+    strncpy(last_open_file, filename, sizeof(last_open_file));
+    last_open_mode = (fi->flags & O_ACCMODE) == O_RDONLY ? 1 : 0;
+    last_open_pid = fuse_get_context()->pid; 
+    copy_logged = 0;
 
     return 0;
 }
 
 
-static int fs_write(const char *path, const char *buf, size_t size, off_t offset,
-                    struct fuse_file_info *fi) {
-    char name[256];
-    snprintf(name, sizeof(name), "%s", path + 1);
-
-    int pieces = 0;
-    for (size_t i = 0; i < size; i += MAX_PIECE_SIZE, pieces++) {
-        char frag_path[512];
-        snprintf(frag_path, sizeof(frag_path), "%s/%s.%03d", RELIC_DIR, name, pieces);
-        FILE *f = fopen(frag_path, "wb");
-        fwrite(buf + i, 1, (size - i > MAX_PIECE_SIZE ? MAX_PIECE_SIZE : size - i), f);
+static int baymax_read(const char *path, char *buf, size_t size, off_t offset,
+                       struct fuse_file_info *fi) {
+    (void) fi;
+    const char *filename = path + 1;
+    char proc_path[64], proc_name[256] = "";
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d/comm", last_open_pid);
+    FILE *f = fopen(proc_path, "r");
+    if (f) {
+        fgets(proc_name, sizeof(proc_name), f);
+        proc_name[strcspn(proc_name, "\n")] = 0; 
         fclose(f);
     }
+    if (last_open_mode == 1 && strcmp(filename, last_open_file) == 0 && !copy_logged) {
+        if (strcmp(proc_name, "cp") == 0) {
+            write_log("COPY: %s -> /tmp/%s", filename, filename);
+            copy_logged = 1;
+        } else if (
+            strcmp(proc_name, "ls") != 0 &&
+            strcmp(proc_name, "fuse") != 0 &&
+            strcmp(proc_name, "fusermount3") != 0 &&
+            strcmp(proc_name, "bash") != 0 &&
+            strcmp(proc_name, "gnome-terminal-") != 0 &&
+            strcmp(proc_name, "code") != 0  
+        ) {
+            write_log("READ: %s", filename);
+        }
+    }
 
-    char log_msg[512];
-    snprintf(log_msg, sizeof(log_msg), "WRITE: %s -> %s.000 to %s.%03d", name, name, name, pieces - 1);
-    write_log(log_msg);
+    size_t total_read = 0;
+    off_t current_offset = 0;
+    char chunk_path[512];
 
-    return size;
+    for (int i = 0; i < MAX_CHUNKS && size > 0; i++) {
+        snprintf(chunk_path, sizeof(chunk_path), "%s/%s.%03d", RELIC_PATH, filename, i);
+        FILE *fp = fopen(chunk_path, "rb");
+        if (!fp) break;
+
+        fseek(fp, 0, SEEK_END);
+        size_t chunk_size = ftell(fp);
+        rewind(fp);
+
+        if (offset < current_offset + chunk_size) {
+            size_t start = offset > current_offset ? (size_t)(offset - current_offset) : 0;
+            size_t to_read = chunk_size - start;
+            if (to_read > size) to_read = size;
+
+            size_t read_bytes = fread(buf + total_read, 1, to_read, fp);
+            total_read += read_bytes;
+            size -= read_bytes;
+        }
+        current_offset += chunk_size;
+        fclose(fp);
+    }
+
+    return total_read;
+}
+static int baymax_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    (void) mode;
+    (void) fi;
+    const char *filename = path + 1;
+    char chunk_path[512];
+
+    snprintf(chunk_path, sizeof(chunk_path), "%s/%s.000", RELIC_PATH, filename);
+
+    FILE *fp = fopen(chunk_path, "wb");
+    if (!fp)
+        return -EIO;
+
+    fclose(fp);
+    return 0;
+}
+static int baymax_write(const char *path, const char *buf, size_t size, off_t offset,
+                        struct fuse_file_info *fi) {
+    (void) fi;
+    if (offset != 0)
+        return 0;
+
+    const char *filename = path + 1;
+    char chunk_path[512];
+
+    size_t written = 0;
+    int chunk_index = 0;
+
+    char chunk_list[1024] = {0};
+    size_t chunk_list_len = 0;
+
+    while (written < size) {
+        snprintf(chunk_path, sizeof(chunk_path), "%s/%s.%03d", RELIC_PATH, filename, chunk_index);
+        FILE *fp = fopen(chunk_path, "wb");
+        if (!fp)
+            return -EIO;
+
+        size_t to_write = CHUNK_SIZE;
+        if (written + to_write > size)
+            to_write = size - written;
+
+        fwrite(buf + written, 1, to_write, fp);
+        fclose(fp);
+        written += to_write;
+        
+        char temp[64];
+        snprintf(temp, sizeof(temp), "%s.%03d", filename, chunk_index);
+        if (chunk_index > 0) {
+            if (chunk_list_len + 2 < sizeof(chunk_list)) {
+                strcat(chunk_list, ", ");
+                chunk_list_len += 2;
+            }
+        }
+        if (chunk_list_len + strlen(temp) < sizeof(chunk_list)) {
+            strcat(chunk_list, temp);
+            chunk_list_len += strlen(temp);
+        }
+
+        chunk_index++;
+    }
+
+    write_log("WRITE: %s -> %s", filename, chunk_list);
+
+    return written;
 }
 
-static int fs_unlink(const char *path) {
-    char name[256];
-    snprintf(name, sizeof(name), "%s", path + 1);
+static int baymax_unlink(const char *path) {
+    const char *filename = path + 1;
+    char chunk_path[512];
+    int i;
+    int removed = 0;
 
-    int i = 0;
-    char frag[512];
-    while (1) {
-        snprintf(frag, sizeof(frag), "%s/%s.%03d", RELIC_DIR, name, i);
-        if (access(frag, F_OK) != 0) break;
-        remove(frag);
-        i++;
+    for (i = 0; i < MAX_CHUNKS; i++) {
+        snprintf(chunk_path, sizeof(chunk_path), "%s/%s.%03d", RELIC_PATH, filename, i);
+        if (access(chunk_path, F_OK) != 0)
+            break;
+        remove(chunk_path);
+        removed = 1;
     }
 
-    if (i > 0) {
-        char log_msg[512];
-        snprintf(log_msg, sizeof(log_msg), "DELETE: %s.000 - %s.%03d", name, name, i - 1);
-        write_log(log_msg);
-    }
+    if (!removed)
+        return -ENOENT;
+
+    if (i > 1)
+        write_log("DELETE: %s.%03d - %s.%03d", filename, 0, filename, i - 1);
+    else
+        write_log("DELETE: %s.%03d", filename, 0);
 
     return 0;
 }
 
-static int fs_release(const char *path, struct fuse_file_info *fi) {
-    close(fi->fh);
-    return 0;
-}
-
-static const struct fuse_operations fs_oper = {
-    .getattr = fs_getattr,
-    .readdir = fs_readdir,
-    .open    = fs_open,
-    .read    = fs_read,
-    .write   = fs_write,
-    .create  = fs_create,
-    .unlink  = fs_unlink,
-    .release = fs_release,
+static struct fuse_operations baymax_oper = {
+    .getattr = baymax_getattr,
+    .readdir = baymax_readdir,
+    .open = baymax_open,
+    .read = baymax_read,
+    .create = baymax_create,
+    .write = baymax_write,
+    .unlink = baymax_unlink,
 };
 
 int main(int argc, char *argv[]) {
-    file_status_table = g_hash_table_new_full(g_str_hash, g_str_equal, free, free);
-
-    DIR *dir = opendir(RELIC_DIR);
-    if (dir) {
-        struct dirent *dp;
-        GHashTable *seen_files = g_hash_table_new(g_str_hash, g_str_equal);
-
-        while ((dp = readdir(dir)) != NULL) {
-            char *dot = strrchr(dp->d_name, '.');
-            if (!dot || strlen(dot) != 4) continue;
-
-            char name[256];
-            strncpy(name, dp->d_name, strlen(dp->d_name) - 4);
-            name[strlen(dp->d_name) - 4] = '\0';
-
-            if (!g_hash_table_contains(seen_files, name)) {
-                g_hash_table_insert(seen_files, strdup(name), GINT_TO_POINTER(1));
-
-                pthread_mutex_lock(&status_lock);
-                file_status_t *status = g_hash_table_lookup(file_status_table, name);
-                if (!status || !status->is_copy) {
-                    char log_msg[1024];
-                    snprintf(log_msg, sizeof(log_msg), "READ: %s", name);
-                    write_log(log_msg);
-                }
-                pthread_mutex_unlock(&status_lock);
-            }
-        }
-        g_hash_table_destroy(seen_files);
-        closedir(dir);
-    }
-
-    return fuse_main(argc, argv, &fs_oper, NULL);
+    return fuse_main(argc, argv, &baymax_oper, NULL);
 }
