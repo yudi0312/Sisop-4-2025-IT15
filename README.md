@@ -6,6 +6,117 @@ Anggota kelompok :
 - Az Zahrra Tasya Adelia	        5027241087
 
 ---
+## Soal 1 - Hex->Image
+Author : Az Zahrra Tasya Adelia - 5027241087
+
+### Deskripsi
+
+a. Mengambil sampel anomali .txt dan memastikan ZIP terhapus
+Fungsi download_and_unpack() melakukan:
+
+1. Download ZIP dari Google Drive menggunakan:
+
+```
+snprintf(cmd, sizeof(cmd),
+         "wget -q --show-progress \"%s\" -O %s",
+         ZIP_URL, ZIP_FILE);
+system(cmd);
+```
+
+2. Ekstrak ZIP ke folder anomali/anomali/ (HEX_DIR):
+
+```
+snprintf(cmd, sizeof(cmd),
+         "unzip -oq %s -d %s",
+         ZIP_FILE, TXT_DIR);
+system(cmd);
+```
+
+3. Hapus file ZIP segera setelah ekstraksi:
+
+```
+ remove(ZIP_FILE);
+```
+
+b. Mengonversi string heksadesimal menjadi file image di direktori image/
+
+1. Fungsi convert_all_hex() melakukan scan anomali/anomali/:
+
+```
+DIR *d = opendir(TXT_DIR);
+while ((e = readdir(d))) {
+    if (e->d_type==DT_REG && strstr(e->d_name, ".txt")) {
+        // buka dan baca seluruh isi file ke buffer `hex`
+        // … lalu:
+        FILE *fout = fopen(png_path, "wb");
+        for (char *p = hex; p[0] && p[1]; p += 2) {
+            if (isxdigit(p[0]) && isxdigit(p[1]))
+                fputc(hex2byte(p[0],p[1]), fout);
+        }
+        fclose(fout);
+    }
+}
+```
+-hex2byte() mengubah dua karakter hex menjadi satu byte biner, dan fputc menulisnya ke file .png.
+-Semua gambar disimpan di folder anomali/image/ yang dibuat oleh ensure_dirs().
+
+c. 
+[nama file asli tanpa .txt]_image_[YYYY-mm-dd]_[HH:MM:SS].png
+
+
+```
+char base[256];
+size_t L = strlen(e->d_name);
+// ambil nama sebelum “.txt”
+strncpy(base, e->d_name, L-4);
+base[L-4] = '\0';
+
+// tanggal & waktu
+time_t t = time(NULL);
+struct tm *tm = localtime(&t);
+char date[11], tmstr[9];
+strftime(date,  sizeof(date),  "%Y-%m-%d", tm);
+strftime(tmstr, sizeof(tmstr), "%H:%M:%S", tm);
+
+// bentuk nama output
+snprintf(png_name, sizeof(png_name),
+         "%s_image_%s_%s.png", base, date, tmstr);
+```
+
+
+![image](https://github.com/user-attachments/assets/43c49e6e-af66-456c-bbd6-f79764caa01a)
+
+d. Mencatat setiap konversi dalam conversion.log
+
+```
+fprintf(logf,
+    "[%04d-%02d-%02d][%02d:%02d:%02d]: Successfully converted hexadecimal text %s to %s\n",
+    tm->tm_year+1900, tm->tm_mon+1, tm->tm_mday,
+    tm->tm_hour, tm->tm_min, tm->tm_sec,
+    e->d_name, png_name);
+```
+
+
+![image](https://github.com/user-attachments/assets/83017056-7196-4e8e-99f1-e2a46926af27)
+
+
+-hex pada text 1
+
+![image](https://github.com/user-attachments/assets/f632c173-44c7-4d1e-8441-f39571d26a23)
+
+
+-contoh gambar 1
+
+![image](https://github.com/user-attachments/assets/e83a5a3e-ec0f-403f-a167-fecc379aa043)
+
+
+Kendala dalam pengerjaan: 
+
+![Screenshot 2025-05-22 161806](https://github.com/user-attachments/assets/f39d4fbb-865f-494a-9bb8-6a279763dda4)
+
+ketika text masih belum bisa di convert.
+
+---
 
 ## Soal 2 - Baymax
 Author : Putu Yudi Nandanjaya Wiraguna - 5027241080
